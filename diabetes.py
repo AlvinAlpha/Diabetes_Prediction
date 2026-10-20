@@ -1,142 +1,237 @@
-############ Import the required Libraries ##################
-import streamlit as st
-import pandas as pd
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.model_selection import train_test_split
+"""Diabetes prediction app.
+
+Place this file next to diabetes.csv and run: streamlit run diabetes.py
+Models are trained once per configuration and reused on Streamlit reruns.
+"""
+
+from pathlib import Path
+
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-from sklearn.metrics import roc_curve, auc, precision_recall_curve
-from sklearn.metrics import precision_score, recall_score
+import pandas as pd
+import streamlit as st
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    auc,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+
+DATA_PATH = Path(__file__).resolve().parent / "diabetes.csv"
+CLASS_NAMES = {0: "Non-Diabetes (無糖尿病)", 1: "Diabetes (糖尿病)"}
+
+
+@st.cache_data
+def load_data():
+    df = pd.read_csv(DATA_PATH)
+    if "Outcome" not in df.columns:
+        raise ValueError("diabetes.csv 缺少 Outcome 欄位")
+    if df.isna().any().any():
+        raise ValueError("diabetes.csv 含有缺失值，請先處理")
+    if set(df["Outcome"].unique()) != {0, 1}:
+        raise ValueError("Outcome 必須包含 0 與 1 兩個類別")
+    return df
+
+
+@st.cache_resource(show_spinner="首次使用此設定，正在訓練模型…")
+def get_trained_model(classifier, train_ratio, parameters, data_fingerprint):
+    """Train once per model/split/parameter/data combination and cache the fitted model."""
+    df = load_data()
+    x = df.drop(columns="Outcome")
+    y = df["Outcome"]
+    x_train, x_test, y_train, y_test = train_test_split(
+        x,
+        y,
+        train_size=train_ratio,
+        random_state=42,
+        stratify=y,
+    )
+
+    if classifier == "Decision Tree":
+        criterion, splitter = parameters
+        model = DecisionTreeClassifier(
+            criterion=criterion, splitter=splitter, random_state=42
+        )
+    elif classifier == "Logistic Regression":
+        c_value, max_iter = parameters
+        model = LogisticRegression(
+            C=c_value, max_iter=max_iter, penalty="l2", random_state=42
+        )
+    elif classifier == "Random Forest":
+        n_estimators, max_depth, bootstrap = parameters
+        model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            bootstrap=bootstrap,
+            random_state=42,
+            n_jobs=-1,
+        )
+    else:
+        raise ValueError(f"未知模型：{classifier}")
+
+    model.fit(x_train, y_train)
+    return model, x_test, y_test, len(x_train)
+
+
+def show_evaluation(model, x_test, y_test, selected_plots):
+    y_pred = model.predict(x_test)
+    st.subheader("模型評估 Model Evaluation")
+    columns = st.columns(4)
+    scores = [
+        ("Accuracy", accuracy_score(y_test, y_pred)),
+        ("Precision", precision_score(y_test, y_pred, zero_division=0)),
+        ("Recall", recall_score(y_test, y_pred, zero_division=0)),
+        ("F1 Score", f1_score(y_test, y_pred, zero_division=0)),
+    ]
+    for column, (name, score) in zip(columns, scores):
+        column.metric(name, f"{score:.3f}")
+
+    if "Confusion Matrix" in selected_plots:
+        st.subheader("Confusion Matrix")
+        fig, ax = plt.subplots()
+        ConfusionMatrixDisplay.from_predictions(
+            y_test,
+            y_pred,
+            labels=[0, 1],
+            display_labels=["Non-Diabetes", "Diabetes"],
+            cmap="Blues",
+            ax=ax,
+        )
+        st.pyplot(fig)
+        plt.close(fig)
+
+    if "ROC Curve" in selected_plots:
+        st.subheader("ROC Curve")
+        class_one_index = list(model.classes_).index(1)
+        y_probability = model.predict_proba(x_test)[:, class_one_index]
+        fpr, tpr, _ = roc_curve(y_test, y_probability)
+        area = auc(fpr, tpr)
+        fig, ax = plt.subplots()
+        ax.plot(fpr, tpr, label=f"ROC curve (AUC = {area:.3f})")
+        ax.plot([0, 1], [0, 1], "k--", label="Random guess")
+        ax.set(xlabel="False Positive Rate", ylabel="True Positive Rate", title="ROC Curve")
+        ax.legend(loc="lower right")
+        st.pyplot(fig)
+        plt.close(fig)
+
+
+def show_single_prediction(model, features):
+    st.subheader("單筆資料預測 Single Prediction")
+    st.caption("輸入單一個案的 8 項特徵，使用上方所選的已快取模型進行預測。")
+    with st.form("single_prediction_form"):
+        values = {}
+        left, right = st.columns(2)
+        for index, feature in enumerate(features.columns):
+            series = features[feature]
+            default = float(series.median())
+            is_integer = pd.api.types.is_integer_dtype(series)
+            with (left if index % 2 == 0 else right):
+                if is_integer:
+                    values[feature] = st.number_input(
+                        feature, min_value=0, value=max(0, int(round(default))), step=1
+                    )
+                else:
+                    values[feature] = st.number_input(
+                        feature, min_value=0.0, value=max(0.0, round(default, 3)),
+                        step=0.1, format="%.3f"
+                    )
+        submitted = st.form_submit_button("預測 Predict", type="primary")
+
+    if submitted:
+        one_record = pd.DataFrame([values], columns=features.columns)
+        predicted_class = int(model.predict(one_record)[0])
+        probabilities = model.predict_proba(one_record)[0]
+        probability_by_class = {
+            int(label): float(probability)
+            for label, probability in zip(model.classes_, probabilities)
+        }
+        st.success(f"預測結果：{CLASS_NAMES[predicted_class]}")
+        st.write(
+            f"無糖尿病機率：**{probability_by_class[0]:.2%}** ｜ "
+            f"糖尿病機率：**{probability_by_class[1]:.2%}**"
+        )
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.pie(
+            [probability_by_class[0], probability_by_class[1]],
+            labels=["Non-Diabetes", "Diabetes"],
+            autopct="%1.1f%%",
+            startangle=90,
+            colors=["#75B9E7", "#F39C87"],
+        )
+        ax.axis("equal")
+        ax.set_title("Single Prediction Probability Distribution")
+        st.pyplot(fig)
+        plt.close(fig)
+        st.caption("此結果僅供機器學習展示，不可作為醫療診斷依據。")
+
 
 def main():
+    st.set_page_config(page_title="Diabetes Prediction", layout="wide")
     st.title("Predicting Diabetes Web App")
-    st.markdown("Affected by Diabetes or not ?")
-    
+    st.markdown("糖尿病預測與模型效能比較")
+
+    try:
+        df = load_data()
+    except (OSError, ValueError) as exc:
+        st.error(f"無法載入 diabetes.csv：{exc}")
+        st.stop()
+
+    features = df.drop(columns="Outcome")
     st.sidebar.title("Model Selection Panel")
-    st.sidebar.markdown("Choose your model and its parameters")
-    
-    @st.cache_data
-    def load_data():# Function to load our dataset
-        data = pd.read_csv("diabetes.csv")
-        return data
-     
-    def split(df):# Split the data to 'train and test' sets
-        #req_cols = ['Pregnancies', 'Insulin', 'BMI', 'Age','Glucose','BloodPressure','DiabetesPedigreeFunction']
-        #x = df[req_cols] # Features for our algorithm
-        y = df.Outcome
-        x = df.drop(columns=['Outcome'])
-        x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.3, random_state=0)
-        return x_train, x_test, y_train, y_test
-     
-    def plot_metrics(metrics_list, model, x_test, y_test, class_names):
-        if 'Confusion Matrix' in metrics_list:
-            st.subheader("Confusion Matrix")
-            
-            # Manually plot confusion matrix
-            cm = confusion_matrix(y_test, model.predict(x_test))
-            disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-            disp.plot(cmap="Blues")
-            st.pyplot(plt.gcf())  # Render the current matplotlib figure
+    classifier = st.sidebar.selectbox(
+        "Classifier / 選擇模型", ("Decision Tree", "Logistic Regression", "Random Forest")
+    )
+    train_percent = st.sidebar.slider(
+        "訓練資料比例 Training Data (%)", min_value=50, max_value=90,
+        value=70, step=5
+    )
+    st.sidebar.caption(f"訓練集：{train_percent}% ｜ 測試集：{100 - train_percent}%")
 
-        if 'ROC Curve' in metrics_list:
-            st.subheader("ROC Curve")
-            
-            # Compute ROC curve and AUC
-            y_prob = model.predict_proba(x_test)[:, 1]  # Assuming binary classification
-            fpr, tpr, _ = roc_curve(y_test, y_prob)
-            roc_auc = auc(fpr, tpr)
-            plt.figure()
-            plt.plot(fpr, tpr, label=f"ROC curve (AUC = {roc_auc:.2f})")
-            plt.plot([0, 1], [0, 1], "k--", label="Random guess")
-            plt.xlabel("False Positive Rate")
-            plt.ylabel("True Positive Rate")
-            plt.title("Receiver Operating Characteristic")
-            plt.legend(loc="lower right")
-            st.pyplot(plt.gcf())  # Render the current matplotlib figure
+    st.sidebar.subheader("Model Parameters")
+    if classifier == "Decision Tree":
+        criterion = st.sidebar.radio("Criterion", ("gini", "entropy"))
+        splitter = st.sidebar.radio("Splitter", ("best", "random"))
+        parameters = (criterion, splitter)
+    elif classifier == "Logistic Regression":
+        c_value = st.sidebar.number_input("C (Regularization)", min_value=0.01,
+                                          max_value=10.0, value=1.0, step=0.01)
+        max_iter = st.sidebar.slider("Maximum iterations", 100, 1000, 500, step=50)
+        parameters = (float(c_value), int(max_iter))
+    else:
+        n_estimators = st.sidebar.slider("Number of trees", 50, 500, 100, step=50)
+        max_depth = st.sidebar.slider("Maximum depth", 1, 20, 5)
+        bootstrap = st.sidebar.checkbox("Bootstrap", value=True)
+        parameters = (n_estimators, max_depth, bootstrap)
 
-        if 'Precision-Recall Curve' in metrics_list:
-            st.subheader("Precision-Recall Curve")
-            
-            # Compute Precision-Recall curve
-            y_prob = model.predict_proba(x_test)[:, 1]  # Assuming binary classification
-            precision, recall, _ = precision_recall_curve(y_test, y_prob)
-            plt.figure()
-            plt.plot(recall, precision, marker=".", label="Precision-Recall Curve")
-            plt.xlabel("Recall")
-            plt.ylabel("Precision")
-            plt.title("Precision-Recall Curve")
-            plt.legend(loc="lower left")
-            st.pyplot(plt.gcf())  # Render the current matplotlib figure
- 
-    df=load_data() 
-    class_names = ['Non-Diabetes', 'Diabetes']
-    x_train, x_test, y_train, y_test = split(df)
- 
-    st.sidebar.subheader("Select your Classifier")
-    classifier = st.sidebar.selectbox("Classifier", ("Decision Tree", "Logistic Regression", "Random Forest"))
-
-    if classifier == 'Decision Tree':
-        st.sidebar.subheader("Model parameters")
-        
-        #choose parameters
-        criterion= st.sidebar.radio("Criterion(measures the quality of split)", ("gini", "entropy"), key='criterion')
-        splitter = st.sidebar.radio("Splitter (How to split at each node?)", ("best", "random"), key='splitter')
-        metrics = st.sidebar.multiselect("Select your metrics : ", ('Confusion Matrix', 'ROC Curve', 'Precision-Recall Curve'))
- 
-        if st.sidebar.button("Classify", key='classify'):
-            st.subheader("Decision Tree Results")
-            model = DecisionTreeClassifier(criterion=criterion, splitter=splitter)
-            model.fit(x_train, y_train)
-            accuracy = model.score(x_test, y_test)
-            y_pred = model.predict(x_test)
-            st.write("Accuracy: ",  round(accuracy * 100, 2),"%")
-            st.write("Precision: ", round(precision_score(y_test, y_pred), 2))
-            st.write("Recall: ", round(recall_score(y_test, y_pred), 2))
-            plot_metrics(metrics, model, x_test, y_test, class_names)
- 
-    if classifier == 'Logistic Regression':
-        st.sidebar.subheader("Model Parameters")
-        C = st.sidebar.number_input("C (Regularization parameter)", 0.01, 10.0, step=0.01, key='C_LR')
-        max_iter = st.sidebar.slider("Maximum number of iterations", 100, 500, key='max_iter')
-
-        metrics = st.sidebar.multiselect("Select your metrics?", ('Confusion Matrix', 'ROC Curve', 'Precision-Recall Curve'))
-
-        if st.sidebar.button("Classify", key='classify'):
-            st.subheader("Logistic Regression Results")
-            model = LogisticRegression(C=C, penalty='l2', max_iter=max_iter)
-            model.fit(x_train, y_train)
-            accuracy = model.score(x_test, y_test)
-            y_pred = model.predict(x_test)
-            st.write("Accuracy: ",  round(accuracy * 100, 2),"%")
-            st.write("Precision: ", round(precision_score(y_test, y_pred), 2))
-            st.write("Recall: ", round(recall_score(y_test, y_pred), 2))
-            plot_metrics(metrics, model, x_test, y_test, class_names)
- 
-    if classifier == 'Random Forest':
-        st.sidebar.subheader("Model Hyperparameters")
-        n_estimators = st.sidebar.number_input("The number of trees in the forest", 100, 5000, step=10, key='n_estimators')
-        max_depth = st.sidebar.number_input("The maximum depth of the tree", 1, 20, step=1, key='max_depth')
-        bootstrap = st.sidebar.radio("Bootstrap samples when building trees", ('True', 'False'), key='bootstrap')
-        
-        metrics = st.sidebar.multiselect("What metrics to plot?", ('Confusion Matrix', 'ROC Curve', 'Precision-Recall Curve'))
-
-        if st.sidebar.button("Classify", key='classify'):
-            st.subheader("Random Forest Results")
-            model = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, bootstrap=bootstrap=='True', n_jobs=-1)
-            model.fit(x_train, y_train)
-            accuracy = model.score(x_test, y_test)
-            y_pred = model.predict(x_test)
-            st.write("Accuracy: ",  round(accuracy * 100, 2),"%")
-            st.write("Precision: ", round(precision_score(y_test, y_pred), 2))
-            st.write("Recall: ", round(recall_score(y_test, y_pred), 2))
-            plot_metrics(metrics, model, x_test, y_test, class_names)
-
-    if st.sidebar.checkbox("Show raw data", False):
+    selected_plots = st.sidebar.multiselect(
+        "Select evaluation plots",
+        ("Confusion Matrix", "ROC Curve"),
+        default=("Confusion Matrix", "ROC Curve"),
+    )
+    if st.sidebar.checkbox("Show raw data", value=False):
         st.subheader("Diabetes Raw Dataset")
-        st.write(df) 
- 
-if __name__ == '__main__':
- main()
+        st.dataframe(df, use_container_width=True)
+
+    # File metadata invalidates cached fitted models if the data changes.
+    stat = DATA_PATH.stat()
+    data_fingerprint = (stat.st_size, stat.st_mtime_ns)
+    model, x_test, y_test, train_count = get_trained_model(
+        classifier, train_percent / 100.0, parameters, data_fingerprint
+    )
+    st.info(
+        f"目前模型：{classifier} ｜ 訓練資料 {train_count} 筆 ｜ "
+        f"測試資料 {len(x_test)} 筆。相同設定會直接使用快取模型。"
+    )
+    show_evaluation(model, x_test, y_test, selected_plots)
+    st.divider()
+    show_single_prediction(model, features)
+
+
+if __name__ == "__main__":
+    main()
